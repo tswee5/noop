@@ -745,10 +745,9 @@ class AiCoach(
             .put("model", model)
             .put("messages", messages)
         if (modernParams) {
-            // #1074: same 4096 cap as the standard path below. This modern-params leg fronts REASONING
-            // models, which count hidden thinking tokens against max_completion_tokens — so 900 starved
-            // them into truncated/empty replies even more readily. A cap, not a target.
-            body.put("max_completion_tokens", 4096)
+            // #1074: this modern-params leg fronts REASONING models, which count hidden thinking tokens
+            // against max_completion_tokens — see REASONING_REPLY_BUDGET. A cap, not a target.
+            body.put("max_completion_tokens", REASONING_REPLY_BUDGET)
         } else {
             body.put("temperature", 0.6)
             // #1074: 900 truncated detailed coaching replies mid-sentence on cloud providers (the reporter
@@ -960,7 +959,7 @@ class AiCoach(
                 .put("messages", messages)
                 .put("stream", true)
             if (modernParams) {
-                body.put("max_completion_tokens", 4096)
+                body.put("max_completion_tokens", REASONING_REPLY_BUDGET)
             } else {
                 body.put("temperature", 0.6)
                 body.put("max_tokens", 4096)
@@ -974,12 +973,31 @@ class AiCoach(
             return builder.build()
         }
 
+        // A stream that ends without one text delta would otherwise read as a bare empty reply; keep
+        // the chunk metadata that says why.
+        var wroteText = false
+        var finishReason: String? = null
+        var streamError: String? = null
+        val extract: (String) -> String? = { payload ->
+            val delta = SseDeltas.openAiDelta(payload)
+            if (delta != null) {
+                wroteText = true
+            } else {
+                openAiStreamNote(payload)?.let { (finish, error) ->
+                    finishReason = finish ?: finishReason
+                    streamError = error ?: streamError
+                }
+            }
+            delta
+        }
+
         try {
-            executeStreaming(request(modernParams = false), provider, onDelta) { payload -> SseDeltas.openAiDelta(payload) }
+            executeStreaming(request(modernParams = false), provider, onDelta, extract)
         } catch (e: StreamingBadRequest) {
             if (!shouldRetryOpenAiModernParams(e.body)) throw e
-            executeStreaming(request(modernParams = true), provider, onDelta) { payload -> SseDeltas.openAiDelta(payload) }
+            executeStreaming(request(modernParams = true), provider, onDelta, extract)
         }
+        if (!wroteText) emptyStreamMessage(finishReason, streamError)?.let { throw Exception(it) }
     }
 
     /** A 400 from [executeStreaming], carrying the raw body so the OpenAI leg can decide to retry. */
@@ -1354,6 +1372,39 @@ class AiCoach(
          * context window (e.g. Ollama's 2048-token default). High enough that normal chats go in full.
          */
         const val MAX_HISTORY_TURNS = 10
+
+        /**
+         * `max_completion_tokens` for the modern-params leg. That leg fronts REASONING models, whose
+         * hidden thinking tokens count against this cap: at 4096, gpt-5-nano could spend all of it
+         * thinking over the metrics context and finish with `length` and no text at all. A cap, not a
+         * target. Matches Swift `OpenAIClient.reasoningReplyBudget`.
+         */
+        const val REASONING_REPLY_BUDGET = 16_384
+
+        /**
+         * Pure: the non-text parts of one OpenAI stream chunk, read only to explain a stream that ended
+         * with no text: the choice's `finish_reason`, or an `error` object a server may send inside a
+         * 200. Null when the chunk carries neither. Twin of Swift `OpenAIClient.streamNote`.
+         */
+        internal fun openAiStreamNote(payload: String): Pair<String?, String?>? {
+            val obj = runCatching { JSONObject(payload) }.getOrNull() ?: return null
+            val finish = obj.optJSONArray("choices")?.optJSONObject(0)
+                ?.takeIf { !it.isNull("finish_reason") }?.optString("finish_reason")
+            val error = obj.optJSONObject("error")?.optString("message")?.takeIf { it.isNotEmpty() }
+            return if (finish == null && error == null) null else finish to error
+        }
+
+        /**
+         * The message for a stream that completed without a single text delta. Null when there is
+         * nothing more specific to say. Twin of Swift `OpenAIClient.emptyStreamError`.
+         */
+        internal fun emptyStreamMessage(finishReason: String?, error: String?): String? = when {
+            !error.isNullOrEmpty() -> "The provider returned an error: $error"
+            finishReason == "length" -> "The model used its whole reply budget before writing an answer. " +
+                "Try again, or choose a smaller or non-reasoning model."
+            finishReason == "content_filter" -> "The provider's content filter withheld the reply."
+            else -> null
+        }
 
         /**
          * Appended to a reply that stopped early with `finish_reason == "length"` — it reached the

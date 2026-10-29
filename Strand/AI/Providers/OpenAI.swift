@@ -30,6 +30,38 @@ struct OpenAIClient: AIProviderClient {
             || d.contains("temperature") || d.contains("unsupported")
     }
 
+    /// `max_completion_tokens` for the modern-params leg. That leg fronts REASONING models, whose
+    /// hidden thinking tokens count against this cap: at 4096, gpt-5-nano could spend all of it
+    /// thinking over the metrics context and finish with `length` and no text at all. A cap, not a
+    /// target. Matches Android `REASONING_REPLY_BUDGET`.
+    static let reasoningReplyBudget = 16_384
+
+    /// Pure: the non-text parts of one stream chunk, read only to explain a stream that ended with
+    /// no text: the choice's `finish_reason`, or an `error` object a server may send inside a 200.
+    static func streamNote(_ payload: String) -> (finishReason: String?, error: String?)? {
+        guard let data = payload.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let finish = (obj["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String
+        let error = (obj["error"] as? [String: Any])?["message"] as? String
+        return (finish == nil && error == nil) ? nil : (finish, error)
+    }
+
+    /// The error for a stream that completed without a single text delta, which the Coach would
+    /// otherwise show as a bare "(no reply)". Nil when there is nothing more specific to say.
+    static func emptyStreamError(finishReason: String?, error: String?) -> AICoachError? {
+        if let error, !error.isEmpty {
+            return .emptyReply("The provider returned an error: \(error)")
+        }
+        if finishReason == "length" {
+            return .emptyReply("The model used its whole reply budget before writing an answer. "
+                + "Try again, or choose a smaller or non-reasoning model.")
+        }
+        if finishReason == "content_filter" {
+            return .emptyReply("The provider's content filter withheld the reply.")
+        }
+        return nil
+    }
+
     /// K1: Stream via `stream: true`. Same body as `send`, with `stream: true` added. SSE parsing
     /// via `SseDeltas.openAiDelta`. Same modern-params retry on 400 as `send`, streamed: the 400
     /// arrives as the HTTP status before any delta, so nothing has been shown when it retries.
@@ -83,7 +115,7 @@ struct OpenAIClient: AIProviderClient {
     ) async throws {
         var body: [String: Any] = ["model": model, "messages": wire, "stream": true]
         if modernParams {
-            body["max_completion_tokens"] = 4096
+            body["max_completion_tokens"] = Self.reasoningReplyBudget
         } else {
             body["temperature"] = 0.6
             body["max_tokens"] = 4096
@@ -95,10 +127,20 @@ struct OpenAIClient: AIProviderClient {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+        var wroteText = false
+        var finishReason: String?
+        var streamError: String?
         try await performStreamingRequest(req, session: session) { payload in
             if let delta = SseDeltas.openAiDelta(payload) {
+                wroteText = true
                 onDelta(delta)
+            } else if let note = Self.streamNote(payload) {
+                finishReason = note.finishReason ?? finishReason
+                streamError = note.error ?? streamError
             }
+        }
+        if !wroteText, let error = Self.emptyStreamError(finishReason: finishReason, error: streamError) {
+            throw error
         }
     }
 
@@ -114,7 +156,7 @@ struct OpenAIClient: AIProviderClient {
         // #1074: 900 truncated detailed coaching replies mid-sentence; 4096 lets a full multi-section
         // reply complete (a cap, not a target — the system prompt keeps it short). Matches Gemini + Android.
         if modernParams {
-            body["max_completion_tokens"] = 4096
+            body["max_completion_tokens"] = Self.reasoningReplyBudget
         } else {
             body["temperature"] = 0.6
             body["max_tokens"] = 4096
