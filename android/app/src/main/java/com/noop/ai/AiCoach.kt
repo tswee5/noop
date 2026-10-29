@@ -937,8 +937,9 @@ class AiCoach(
     // K1: Streaming provider calls (SSE via OkHttp BufferedSource)
     // ---------------------------------------------------------------------------------------
 
-    /** Stream an OpenAI-compatible chat (OpenAI + Custom). Same body as [callOpenAiCompatible]'s
-     *  standard-params path, with `stream: true`. SSE parsed via [SseDeltas.openAiDelta]. */
+    /** Stream an OpenAI-compatible chat (OpenAI + Custom). Same body as [callOpenAiCompatible], with
+     *  `stream: true`, including its modern-params retry on 400: the 400 arrives as the HTTP status
+     *  before any delta, so nothing has been shown when it retries. SSE parsed via [SseDeltas.openAiDelta]. */
     private fun callOpenAiCompatibleStream(
         provider: AiProvider,
         url: String,
@@ -953,22 +954,36 @@ class AiCoach(
         messages.put(JSONObject().put("role", "system").put("content", systemPrompt))
         for (m in history) messages.put(JSONObject().put("role", m.role).put("content", m.text))
 
-        val body = JSONObject()
-            .put("model", model)
-            .put("messages", messages)
-            .put("temperature", 0.6)
-            .put("max_tokens", 4096)
-            .put("stream", true)
-            .toString()
-
-        val builder = Request.Builder().url(url).addHeader("Content-Type", "application/json")
-            .post(body.toRequestBody(JSON))
-        when (provider) {
-            AiProvider.CUSTOM -> applyCustomAuthHeader(builder, key, customAuthHeader)
-            else -> if (!key.isNullOrBlank()) builder.addHeader("Authorization", "Bearer $key")
+        fun request(modernParams: Boolean): Request {
+            val body = JSONObject()
+                .put("model", model)
+                .put("messages", messages)
+                .put("stream", true)
+            if (modernParams) {
+                body.put("max_completion_tokens", 4096)
+            } else {
+                body.put("temperature", 0.6)
+                body.put("max_tokens", 4096)
+            }
+            val builder = Request.Builder().url(url).addHeader("Content-Type", "application/json")
+                .post(body.toString().toRequestBody(JSON))
+            when (provider) {
+                AiProvider.CUSTOM -> applyCustomAuthHeader(builder, key, customAuthHeader)
+                else -> if (!key.isNullOrBlank()) builder.addHeader("Authorization", "Bearer $key")
+            }
+            return builder.build()
         }
-        executeStreaming(builder.build(), provider, onDelta) { payload -> SseDeltas.openAiDelta(payload) }
+
+        try {
+            executeStreaming(request(modernParams = false), provider, onDelta) { payload -> SseDeltas.openAiDelta(payload) }
+        } catch (e: StreamingBadRequest) {
+            if (!shouldRetryOpenAiModernParams(e.body)) throw e
+            executeStreaming(request(modernParams = true), provider, onDelta) { payload -> SseDeltas.openAiDelta(payload) }
+        }
     }
+
+    /** A 400 from [executeStreaming], carrying the raw body so the OpenAI leg can decide to retry. */
+    private class StreamingBadRequest(val body: String, message: String) : Exception(message)
 
     /** Stream an Anthropic chat. Same body as [callAnthropic], with `stream: true`. SSE parsed
      *  via [SseDeltas.anthropicDelta]. */
@@ -1049,7 +1064,9 @@ class AiCoach(
             http.newCall(request).execute().use { resp ->
                 if (resp.code !in 200..299) {
                     val body = resp.body?.string().orEmpty()
-                    throw httpError(provider, resp.code, body)
+                    val error = httpError(provider, resp.code, body)
+                    if (resp.code == 400) throw StreamingBadRequest(body, error.message.orEmpty())
+                    throw error
                 }
                 val source = resp.body?.source()
                     ?: throw Exception("The provider returned an empty streaming response.")
