@@ -425,6 +425,9 @@ public struct OverviewHRChart: View {
     }
 
     public var body: some View {
+        let ticks = xTicks
+        let subHour = ticks.count > 1 && ticks[1].timeIntervalSince(ticks[0]) < 3_600
+        let labelStride = chartTimeLabelStride(tickCount: ticks.count)
         Chart { marks }
         .chartXScale(domain: xDomain)
         .chartYScale(domain: valueRange)
@@ -434,10 +437,20 @@ public struct OverviewHRChart: View {
         .chartXAxis {
             // Manual ticks chosen by visible span (6h down to 1min), matching Android chartTimeTicks.
             // Swift Charts' .automatic(desiredCount:) doesn't guarantee per-minute ticks at deep zoom.
-            AxisMarks(values: xTicks) { _ in
+            // Sub-hour ticks get compact "h:mm" labels on every `labelStride`-th tick: six or more
+            // "11:45 AM" labels don't fit across a phone, and overprinted each other once the Deep
+            // Timeline was zoomed under an hour. Gridlines stay on every tick; hour-and-up ticks keep
+            // the locale's own short label ("6 AM").
+            AxisMarks(values: ticks) { value in
                 AxisGridLine().foregroundStyle(StrandPalette.hairline.opacity(0.4))
-                AxisValueLabel().foregroundStyle(StrandPalette.textTertiary)
-                    .font(StrandFont.footnote)
+                if !subHour {
+                    AxisValueLabel().foregroundStyle(StrandPalette.textTertiary)
+                        .font(StrandFont.footnote)
+                } else if value.index % labelStride == 0 {
+                    AxisValueLabel(format: chartSubHourLabelFormat(showsPeriod: value.index == 0))
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .font(StrandFont.footnote)
+                }
             }
         }
         .chartYAxis {
@@ -557,6 +570,21 @@ public struct OverviewHRChart: View {
 }
 
 // MARK: - Chart time ticks (x-axis)
+
+/// How many ticks apart to put sub-hour x-axis LABELS so at most `maxLabels` are drawn. The deep-zoom
+/// tiers can return up to 15 ticks; five compact labels fit across a phone-width plot. Pure.
+public func chartTimeLabelStride(tickCount: Int, maxLabels: Int = 5) -> Int {
+    guard maxLabels > 0, tickCount > maxLabels else { return 1 }
+    return (tickCount + maxLabels - 1) / maxLabels
+}
+
+/// Compact sub-hour tick label: "11:45" ("13:05" in 24-hour locales). `showsPeriod` keeps "AM"/"PM"
+/// on the first label only, so a 12-hour reader still knows which half of the day it is.
+public func chartSubHourLabelFormat(showsPeriod: Bool) -> Date.FormatStyle {
+    Date.FormatStyle(date: .omitted, time: .omitted)
+        .hour(.defaultDigits(amPM: showsPeriod ? .abbreviated : .omitted))
+        .minute(.twoDigits)
+}
 
 /// Round wall-clock x-axis tick DATES for a `[start, end]` window, at fixed round intervals chosen by
 /// the visible span (a full day ticks every 6h, a 1h window every 15min). Ticks step in LOCAL

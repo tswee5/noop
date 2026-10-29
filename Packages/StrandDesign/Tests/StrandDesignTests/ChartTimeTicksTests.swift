@@ -91,4 +91,32 @@ final class ChartTimeTicksTests: XCTestCase {
         XCTAssertEqual(ticks(t, t), [])
         XCTAssertEqual(ticks(at(2026, 7, 10, 15, 0), at(2026, 7, 10, 14, 0)), [])
     }
+
+    // MARK: Sub-hour labels (Swift-only: the Kotlin side formats its own "HH:mm")
+
+    /// A ~30-minute Deep Timeline window gives six 5-minute ticks; labelling all six overprinted on a
+    /// phone. The stride caps labels at five, and every tier's worst case stays within that.
+    func testLabelStrideCapsLabelsAtFive() {
+        XCTAssertEqual(chartTimeLabelStride(tickCount: 0), 1)
+        XCTAssertEqual(chartTimeLabelStride(tickCount: 5), 1)
+        XCTAssertEqual(chartTimeLabelStride(tickCount: 6), 2)
+        XCTAssertEqual(chartTimeLabelStride(tickCount: 15), 3)
+        for count in 0...15 {
+            let stride = chartTimeLabelStride(tickCount: count)
+            let labelled = (0..<count).filter { $0 % stride == 0 }.count
+            XCTAssertLessThanOrEqual(labelled, 5, "\(count) ticks")
+        }
+    }
+
+    func testSubHourLabelIsCompactWithPeriodOnlyWhenAsked() {
+        func label(_ showsPeriod: Bool, _ locale: String) -> String {
+            var style = chartSubHourLabelFormat(showsPeriod: showsPeriod).locale(Locale(identifier: locale))
+            style.timeZone = calendar.timeZone
+            return at(2026, 7, 10, 11, 45).formatted(style)
+        }
+        XCTAssertEqual(label(false, "en_US"), "11:45")
+        XCTAssertTrue(label(true, "en_US").hasPrefix("11:45"))
+        XCTAssertGreaterThan(label(true, "en_US").count, 5, "the first label keeps AM/PM")
+        XCTAssertEqual(label(false, "en_GB"), "11:45")
+    }
 }
